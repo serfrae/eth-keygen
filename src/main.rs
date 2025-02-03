@@ -1,14 +1,14 @@
 use anyhow::Result;
 use clap::Parser;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use k256::ecdsa::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use sha3::{Digest, Keccak256};
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use std::sync::mpsc;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -23,7 +23,10 @@ struct Args {
     is_checksum: bool,
 
     #[arg(short = 'o', long, required = false)]
-    outfile: PathBuf,
+    outfile: Option<PathBuf>,
+
+    #[arg(short = 'n', long, default_value = "1")]
+    num_matches: u64,
 }
 
 #[derive(Debug)]
@@ -109,17 +112,21 @@ fn to_checksum_address(address: &str) -> String {
         .collect()
 }
 
-fn save_wallet(address: &str, secret: &str) -> std::io::Result<()> {
-    let mut file = File::create("address.txt")?;
+fn save_wallet(address: &str, secret: &str, outfile: Option<&PathBuf>) -> std::io::Result<()> {
+    let path = match outfile {
+        Some(path) => path,
+        None => &PathBuf::from(format!("{address}.txt")),
+    };
+    let mut file = File::create(path)?;
     writeln!(file, "Address: {}", address)?;
     writeln!(file, "Private Key: {}", secret)?;
     Ok(())
 }
 
 fn main() {
+    let start = std::time::Instant::now();
     let args = Args::parse();
-    let total_attempts = Arc::new(AtomicU64::new(0));
-    let total_attempts_clone = Arc::clone(&total_attempts);
+    let (counter_tx, counter_rx) = mpsc::channel::<()>();
 
     ctrlc::set_handler(move || {
         println!("\nCaught interrupt signal, exiting...");
@@ -128,10 +135,29 @@ fn main() {
     .expect("Error setting Ctrl-C handler");
 
     std::thread::spawn(move || {
+        let mut counter = 0u64;
+        let multi = MultiProgress::new();
+        let pb = multi.add(ProgressBar::new_spinner());
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] {pos}/{len} addresses found ({msg} searched)",
+                )
+                .unwrap(),
+        );
+        pb.enable_steady_tick(Duration::from_millis(100));
+
         loop {
-            std::thread::sleep(Duration::from_millis(100));
-            let attempts = total_attempts_clone.load(Ordering::Relaxed);
-            println!("Total checked addresses: {}", attempts);
+            match counter_rx.recv() {
+                Ok(_) => {
+                    counter += 1;
+                    pb.set_message(counter.to_string());
+                }
+                Err(e) => {
+                    eprintln!("Error receiving counter: {}", e);
+                    break;
+                }
+            }
         }
     });
 
@@ -143,11 +169,13 @@ fn main() {
     for i in 0..num_threads {
         let tx: std::sync::mpsc::Sender<Result<(String, String)>> = tx.clone();
         let args = args.clone();
+        let counter_tx = counter_tx.clone();
 
         std::thread::spawn(move || {
             println!("Worker thread {} started", i);
 
             loop {
+                counter_tx.send(()).unwrap();
                 let wallet = get_random_wallet();
 
                 if is_valid_address(
@@ -164,23 +192,33 @@ fn main() {
         });
     }
 
-    match rx.recv() {
-        Ok(Ok((address, secret))) => {
-            println!("Found matching address!");
-            println!("Address: {}", address);
-            println!("Secret: {}", secret);
+    let mut matches = 0u64;
+    while matches < args.num_matches {
+        match rx.recv() {
+            Ok(Ok((address, secret))) => {
+                println!("Found matching address!");
+                println!("Address: {}", address);
+                println!("Secret: {}", secret);
 
-            if let Err(e) = save_wallet(&address, &secret) {
-                eprintln!("Error saving wallet to file: {}", e);
-            } else {
-                println!("Address and private key saved to vanity-address.txt");
+                if let Err(e) = save_wallet(&address, &secret, args.outfile.as_ref()) {
+                    eprintln!("Error saving wallet to file: {}", e);
+                } else {
+                    println!("Address and private key saved to {address}.txt");
+                    matches += 1;
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("Error: {}", e);
+            }
+            Err(e) => {
+                eprintln!("Channel error: {}", e);
             }
         }
-        Ok(Err(e)) => {
-            eprintln!("Error: {}", e);
-        }
-        Err(e) => {
-            eprintln!("Channel error: {}", e);
-        }
     }
+
+    println!(
+        "{} matches found in: {:.2?}",
+        args.num_matches,
+        start.elapsed()
+    );
 }
